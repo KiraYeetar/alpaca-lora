@@ -57,6 +57,7 @@ def train(
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
     load_in_8bit: bool = True,
+    special_pad: bool = True,
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -83,7 +84,8 @@ def train(
             f"wandb_log_model: {wandb_log_model}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template_name}\n"
-            f"load_in_8bit:{str(load_in_8bit)}"
+            f"load_in_8bit: {str(load_in_8bit)}"
+            f"special_pad: {str(special_pad)}"
         )
     assert (
         base_model
@@ -133,18 +135,34 @@ def train(
         torch_dtype=torch.float16,
         device_map=device_map,
     )
+    model = prepare_model_for_int8_training(model)
+
     # 读取llm基模型的分词器
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
-    # 填充的token_id, 与unk_token相同 (facebook的llm基模型pad_token_id是-1)
-    """ From https://github.com/tloen/alpaca-lora/issues/7
-    Sure. I don't think the Facebook code has any need for pad tokens because it's just inference, 
-      so -1 is a null value. I do need a pad token for training, but if I set the pad_token to the eos_token, 
-      like some people have recommended, the eos_token will be ignored in training. 
-    To get both padding and an eos_token, I just use the unk_token as the pad_token.
-    """
-    tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
-    # 从左开始填充:  123 ->  [PAD][PAD]123
-    tokenizer.padding_side = "left"  # Allow batched inference
+
+    if special_pad:
+        # TODO 考虑是否删除此处逻辑
+        # 填充的token_id, 与unk_token相同 (facebook的llm基模型pad_token_id是-1)
+        """ From https://github.com/tloen/alpaca-lora/issues/7
+        Sure. I don't think the Facebook code has any need for pad tokens because it's just inference, 
+          so -1 is a null value. I do need a pad token for training, but if I set the pad_token to the eos_token, 
+          like some people have recommended, the eos_token will be ignored in training. 
+        To get both padding and an eos_token, I just use the unk_token as the pad_token.
+        """
+        tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
+        # 从左开始填充:  123 ->  [PAD][PAD]123
+        tokenizer.padding_side = "left"  # Allow batched inference
+
+    # 读取lora模型
+    config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=lora_target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, config)
 
     def tokenize(prompt, add_eos_token=True):
         # there's probably a way to do this with the tokenizer settings
@@ -198,18 +216,6 @@ def train(
                 tokenized_full_prompt["labels"][user_prompt_len:]  #
             )  # could be sped up, probably
         return tokenized_full_prompt
-
-    model = prepare_model_for_int8_training(model)
-
-    config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
 
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)
