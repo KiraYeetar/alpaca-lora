@@ -56,6 +56,7 @@ def train(
     wandb_log_model: str = "",  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    load_in_8bit: bool = True,
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -82,15 +83,30 @@ def train(
             f"wandb_log_model: {wandb_log_model}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template_name}\n"
+            f"load_in_8bit:{str(load_in_8bit)}"
         )
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+
+    # 梯度累加的step数（一个batch一累加, 变成n个mini_batch再累加, 适合多卡训练、减少显存消耗）
     gradient_accumulation_steps = batch_size // micro_batch_size
 
+    # 读本地的 prompt 模板
+    """
+    {
+        "description": "Template used by Alpaca-LoRA.",
+        "prompt_input": "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
+        "prompt_no_input": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n",
+        "response_split": "### Response:"
+    }
+    """
     prompter = Prompter(prompt_template_name)
 
+    # 硬件设置为自动判断
     device_map = "auto"
+
+    #
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     if ddp:
@@ -98,6 +114,7 @@ def train(
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
     # Check if parameter passed or if set within environ
+    # 判断是否要监控模型训练，使用 wandb
     use_wandb = len(wandb_project) > 0 or (
         "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
     )
@@ -109,18 +126,24 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
+    # 读取llm基模型
     model = LlamaForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=True,
+        load_in_8bit=load_in_8bit,
         torch_dtype=torch.float16,
         device_map=device_map,
     )
-
+    # 读取llm基模型的分词器
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
-
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
-    )
+    # 填充的token_id, 与unk_token相同 (facebook的llm基模型pad_token_id是-1)
+    """ From https://github.com/tloen/alpaca-lora/issues/7
+    Sure. I don't think the Facebook code has any need for pad tokens because it's just inference, 
+      so -1 is a null value. I do need a pad token for training, but if I set the pad_token to the eos_token, 
+      like some people have recommended, the eos_token will be ignored in training. 
+    To get both padding and an eos_token, I just use the unk_token as the pad_token.
+    """
+    tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
+    # 从左开始填充:  123 ->  [PAD][PAD]123
     tokenizer.padding_side = "left"  # Allow batched inference
 
     def tokenize(prompt, add_eos_token=True):
@@ -133,6 +156,7 @@ def train(
             padding=False,
             return_tensors=None,
         )
+        # 如果token数小于 cutoff_len，且最后一个token不是eos_token，则加入eos_token
         if (
             result["input_ids"][-1] != tokenizer.eos_token_id
             and len(result["input_ids"]) < cutoff_len
@@ -140,35 +164,39 @@ def train(
         ):
             result["input_ids"].append(tokenizer.eos_token_id)
             result["attention_mask"].append(1)
-
         result["labels"] = result["input_ids"].copy()
-
         return result
 
     def generate_and_tokenize_prompt(data_point):
+        # 转化为prompt格式
         full_prompt = prompter.generate_prompt(
             data_point["instruction"],
             data_point["input"],
             data_point["output"],
         )
+        # 分词 {inputs_id:[...], attention_mask:[...], label:[...]}，
+        # inputs_id 与 label 相同
         tokenized_full_prompt = tokenize(full_prompt)
+
         if not train_on_inputs:
+            # prompt不带output, 即输出无Response
             user_prompt = prompter.generate_prompt(
-                data_point["instruction"], data_point["input"]
+                data_point["instruction"],
+                data_point["input"]
             )
+            # 分词 {inputs_id:[...], attention_mask:[...], label:[...]}
             tokenized_user_prompt = tokenize(
                 user_prompt, add_eos_token=add_eos_token
             )
             user_prompt_len = len(tokenized_user_prompt["input_ids"])
-
             if add_eos_token:
                 user_prompt_len -= 1
-
-            tokenized_full_prompt["labels"] = [
-                -100
-            ] * user_prompt_len + tokenized_full_prompt["labels"][
-                user_prompt_len:
-            ]  # could be sped up, probably
+            # 给 label 赋值: [-100] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
+            # 即 label = [-100]*(无resp的token) + resp的token | 也就是把resp之前的token用-100填充了
+            tokenized_full_prompt["labels"] = (
+                [-100] * user_prompt_len +  # 填充
+                tokenized_full_prompt["labels"][user_prompt_len:]  #
+            )  # could be sped up, probably
         return tokenized_full_prompt
 
     model = prepare_model_for_int8_training(model)
