@@ -6,6 +6,8 @@ import fire
 import torch
 import transformers
 from datasets import load_dataset
+import deepspeed
+import mpi4py
 
 """
 Unused imports:
@@ -58,6 +60,7 @@ def train(
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
     load_in_8bit: bool = True,
     special_pad: bool = True,
+    df_config: str = None,
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -86,6 +89,7 @@ def train(
             f"prompt template: {prompt_template_name}\n"
             f"load_in_8bit: {str(load_in_8bit)}"
             f"special_pad: {str(special_pad)}"
+            f"df_config: {str(df_config)}"
         )
     assert (
         base_model
@@ -287,6 +291,7 @@ def train(
             group_by_length=group_by_length,
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
+            deepspeed=df_config
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
