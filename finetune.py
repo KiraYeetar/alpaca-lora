@@ -87,9 +87,9 @@ def train(
             f"wandb_log_model: {wandb_log_model}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template_name}\n"
-            f"load_in_8bit: {str(load_in_8bit)}"
-            f"special_pad: {str(special_pad)}"
-            f"df_config: {str(df_config)}"
+            f"load_in_8bit: {str(load_in_8bit)}\n"
+            f"special_pad: {str(special_pad)}\n"
+            f"ds_config: {str(df_config)}\n"
         )
     assert (
         base_model
